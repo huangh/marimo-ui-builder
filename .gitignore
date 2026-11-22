@@ -3,3 +3,4 @@ __pycache__/
 __marimo__/
 *.pyc
 .pytest_cache/
+dist/
