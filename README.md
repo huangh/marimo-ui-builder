@@ -69,3 +69,15 @@ apply the op twice.
 - `Pipeline.to_sql()` DuckDB SQL, one CTE per step, reading from `source`
 - `Pipeline.run_duckdb()` runs that SQL in DuckDB (used by the tests to check both agree)
 - `Pipeline.explain()` polars' own optimized plan
+
+## Plot performance bench
+
+`notebooks/plot_perf.py` is a standalone notebook (its own inline dependencies, not part of the
+package) comparing scatter plots from 100k to 10M points across Plotly, Altair, matplotlib,
+Bokeh, datashader, HoloViews, jupyter-scatter and lonboard:
+
+```bash
+uvx marimo edit --sandbox notebooks/plot_perf.py
+```
+
+Findings: `notebooks/plot_perf_findings.md`.
