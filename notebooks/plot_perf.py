@@ -41,7 +41,9 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import importlib
     import re
+    import sys
     import time
 
     import altair as alt
@@ -52,7 +54,7 @@ def _():
     import polars as pl
     import traitlets
 
-    return alt, anywidget, mo, np, pd, pl, re, time, traitlets
+    return alt, anywidget, importlib, mo, np, pd, pl, re, sys, time, traitlets
 
 
 @app.cell(hide_code=True)
@@ -117,14 +119,21 @@ def _(FrameMeter, mo):
 
 
 @app.cell(hide_code=True)
-def _():
+def _(sys):
+    # True in the GitHub Pages (WASM/Pyodide) build, where Python itself runs in the tab.
+    IN_BROWSER = sys.platform == "emscripten"
+
     # Renderer labels answer "does it use the GPU?". GPU here always means the viewer's
     # browser GPU via WebGL; nothing below uses a server GPU unless noted.
+    # wasm=False: needs native code with no Pyodide build (numba, Rust), so it is left
+    # out of the browser build.
     LIBS = {
         "plotly": dict(
             name="Plotly Scattergl (mo.ui.plotly)",
             renderer="Browser GPU (WebGL)",
-            limit=3_000_000,
+            # In the browser build marimo's 8 MB output cap can't be raised, which Plotly
+            # hits at about 750k points.
+            limit=700_000 if IN_BROWSER else 3_000_000,
         ),
         "bokeh": dict(
             name="Bokeh scatter, output_backend='webgl'",
@@ -140,6 +149,7 @@ def _():
             name="lonboard ScatterplotLayer (anywidget, deck.gl)",
             renderer="Browser GPU (WebGL); points placed over Boston as lon/lat",
             limit=None,
+            wasm=False,
         ),
         "altair": dict(
             name="Altair mark_circle (mo.ui.altair_chart)",
@@ -147,7 +157,7 @@ def _():
             limit=500_000,
         ),
         "altair_vf": dict(
-            name="Altair 2D-binned heatmap + VegaFusion",
+            name="Altair 2D-binned heatmap (VegaFusion, or polars in the browser build)",
             renderer="Server CPU aggregation, then browser CPU (Vega canvas)",
             limit=None,
         ),
@@ -160,18 +170,25 @@ def _():
             name="datashader to PNG",
             renderer="Server CPU (numba); can use a server GPU via cuDF/CuPy on CUDA",
             limit=None,
+            wasm=False,
         ),
         "holoviews": dict(
             name="HoloViews rasterize (Bokeh + Panel), hvplot-compatible",
             renderer="Server CPU raster (datashader), re-rasterizes on zoom",
             limit=None,
+            wasm=False,
         ),
     }
-    return (LIBS,)
+    if IN_BROWSER:
+        for _lib in LIBS.values():
+            _lib["renderer"] = _lib["renderer"].replace("Server CPU", "Python CPU (Pyodide, in this tab)")
+    BROWSER_SKIPPED = [v["name"] for v in LIBS.values() if IN_BROWSER and not v.get("wasm", True)]
+    LIBS = {k: v for k, v in LIBS.items() if not (IN_BROWSER and not v.get("wasm", True))}
+    return BROWSER_SKIPPED, IN_BROWSER, LIBS
 
 
 @app.cell(hide_code=True)
-def _(LIBS, mo, np):
+def _(BROWSER_SKIPPED, LIBS, mo, np):
     def _log_steps(lo_exp, hi_exp, per_decade=10):
         exps = np.linspace(lo_exp, hi_exp, int((hi_exp - lo_exp) * per_decade) + 1)
         return sorted({int(round(10**e, -3)) for e in exps})
@@ -196,7 +213,7 @@ def _(LIBS, mo, np):
     dtype = mo.ui.dropdown(["float32", "float64"], value="float32", label="Coordinate dtype")
     libs = mo.ui.multiselect(
         {v["name"]: k for k, v in LIBS.items()},
-        value=[LIBS[k]["name"] for k in ("plotly", "jscatter", "datashader")],
+        value=[LIBS[k]["name"] for k in ("plotly", "jscatter", "datashader", "matplotlib") if k in LIBS][:3],
         label="Libraries",
         full_width=True,
     )
@@ -209,17 +226,24 @@ def _(LIBS, mo, np):
             mo.hstack([mode, mo.vstack([budget, z_cut, highlight, dtype])], justify="start", gap=3),
             libs,
             mo.hstack([run, force], justify="start"),
+            mo.md(
+                "**Browser build:** Python runs inside this tab (Pyodide, single-threaded, about 2 to 4 GB of "
+                "memory), so Python timings are slower than on a server, and 10M points may run out of memory. "
+                "Left out because they need native code with no browser build: "
+                + ", ".join(BROWSER_SKIPPED)
+                + ". Run the notebook locally (`uvx marimo edit --sandbox notebooks/plot_perf.py`) to try them."
+            )
+            if BROWSER_SKIPPED
+            else mo.md(""),
         ]
     )
     return budget, dtype, force, highlight, libs, mode, n_points, run, z_cut
 
 
 @app.cell(hide_code=True)
-def _(dtype, mo, np, pl, time):
-    N_MAX = 10_000_000
-
+def _(dtype, mo, n_points, np, pl, time):
     def make_points(n, dt, seed=0):
-        """Mixture of blobs plus planted outliers. Rows are in random order, so any prefix is a fair sample."""
+        """Mixture of blobs plus planted outliers (a ring and a tiny far-away cluster)."""
         rng = np.random.default_rng(seed)
         #            weight   cx    cy    sx    sy
         comps = [
@@ -242,14 +266,14 @@ def _(dtype, mo, np, pl, time):
         return pl.DataFrame({"x": x, "y": y, "planted": comp >= 3})
 
     _t0 = time.perf_counter()
-    full = make_points(N_MAX, getattr(np, dtype.value))
+    full = make_points(n_points.value, getattr(np, dtype.value))
     gen_s = time.perf_counter() - _t0
-    mo.md(f"Generated {N_MAX:,} {dtype.value} points in {gen_s:.2f} s (once per dtype).")
+    mo.md(f"Generated {n_points.value:,} {dtype.value} points in {gen_s:.2f} s.")
     return (full,)
 
 
 @app.cell(hide_code=True)
-def _(budget, full, highlight, mo, mode, n_points, pl, time, z_cut):
+def _(budget, full, highlight, mo, mode, pl, time, z_cut):
     def flag_outliers(lf: pl.LazyFrame, k: float) -> pl.LazyFrame:
         """Robust distance from the center: per-axis z-scores from median/MAD, combined as
         sqrt(zx^2 + zy^2). A LazyFrame -> LazyFrame op, so it could be registered with the
@@ -263,7 +287,7 @@ def _(budget, full, highlight, mo, mode, n_points, pl, time, z_cut):
         return lf.with_columns(outlier=(rz("x") ** 2 + rz("y") ** 2).sqrt() > k)
 
     _t0 = time.perf_counter()
-    _lf = full.lazy().head(n_points.value)
+    _lf = full.lazy()
     _need_flags = mode.value == "outlier_sample" or highlight.value
     if _need_flags:
         _lf = flag_outliers(_lf, z_cut.value)
@@ -395,7 +419,12 @@ def _(Timer, card, gate, mo, np, pd, xo, xs, yo, ys):
     jscatter_row = None
     _view = gate("jscatter")
     if _view is None:
-        import jscatter as _jscatter
+        try:
+            import jscatter as _jscatter
+        except ImportError as _e:  # e.g. a dependency without a browser build
+            _jscatter = None
+            _view = mo.callout(mo.md(f"jupyter-scatter isn't available here: `{_e}`"), kind="warn")
+    if _view is None:
 
         _t = Timer()
         _pdf = pd.DataFrame(
@@ -421,13 +450,14 @@ def _(Timer, card, gate, mo, np, pd, xo, xs, yo, ys):
 
 
 @app.cell
-def _(Timer, card, gate, mo, np, xo, xs, yo, ys):
+def _(IN_BROWSER, Timer, card, gate, importlib, mo, np, xo, xs, yo, ys):
     lonboard_row = None
-    _view = gate("lonboard")
+    # importlib (not `import`) keeps the browser build from trying to install these.
+    _view = mo.md("") if IN_BROWSER else gate("lonboard")
     if _view is None:
-        import pyarrow as _pa
-        from lonboard import Map as _Map
-        from lonboard import ScatterplotLayer as _Layer
+        _pa = importlib.import_module("pyarrow")
+        _lb = importlib.import_module("lonboard")
+        _Map, _Layer = _lb.Map, _lb.ScatterplotLayer
 
         def _points_table(x, y):
             # Fake lon/lat around Boston so the bench runs on any x/y data.
@@ -471,30 +501,59 @@ def _(Timer, alt, card, gate, html_payload, mo, outliers, shown):
 
 
 @app.cell
-def _(Timer, alt, card, gate, html_payload, mo, outliers, shown):
+def _(IN_BROWSER, Timer, alt, card, gate, html_payload, mo, outliers, pl, shown):
     altair_vf_row = None
     _view = gate("altair_vf")
     if _view is None:
         _t = Timer()
-        with alt.data_transformers.enable("vegafusion"):
-            _heat = (
-                alt.Chart(shown.select("x", "y"))
-                .mark_rect()
-                .encode(
-                    alt.X("x:Q", bin=alt.Bin(maxbins=160)),
-                    alt.Y("y:Q", bin=alt.Bin(maxbins=90)),
-                    alt.Color("count():Q", scale=alt.Scale(type="log"), legend=None),
+        _out = alt.Chart(outliers.select("x", "y")).mark_circle(size=12, color="red").encode(x="x:Q", y="y:Q")
+        if IN_BROWSER:
+            # VegaFusion is Rust with no Pyodide build: bin with polars instead, same result.
+            _nx, _ny = 160, 90
+            _bins = (
+                shown.lazy()
+                .with_columns(
+                    bx=((pl.col("x") - pl.col("x").min()) / (pl.col("x").max() - pl.col("x").min()) * (_nx - 1)).floor(),
+                    by=((pl.col("y") - pl.col("y").min()) / (pl.col("y").max() - pl.col("y").min()) * (_ny - 1)).floor(),
+                    x0=pl.col("x").min(), x1=pl.col("x").max(), y0=pl.col("y").min(), y1=pl.col("y").max(),
                 )
+                .group_by("bx", "by")
+                .agg(n=pl.len(), x0=pl.first("x0"), x1=pl.first("x1"), y0=pl.first("y0"), y1=pl.first("y1"))
+                .with_columns(
+                    x=pl.col("x0") + pl.col("bx") * (pl.col("x1") - pl.col("x0")) / (_nx - 1),
+                    y=pl.col("y0") + pl.col("by") * (pl.col("y1") - pl.col("y0")) / (_ny - 1),
+                )
+                .select("x", "y", "n")
+                .collect()
             )
-            _out = alt.Chart(outliers.select("x", "y")).mark_circle(size=12, color="red").encode(x="x:Q", y="y:Q")
+            _heat = (
+                alt.Chart(_bins)
+                .mark_square(size=30)
+                .encode(x="x:Q", y="y:Q", color=alt.Color("n:Q", scale=alt.Scale(type="log"), legend=None))
+            )
             _el = mo.ui.altair_chart(
                 (_heat + _out).properties(width="container", height=420), chart_selection=False, legend_selection=False
             )
-        _view, altair_vf_row = card(
-            "altair_vf", _el, _t.s(), html_payload(_el.text),
-            "VegaFusion runs the binning in Python, so only bins (plus outlier points) reach the browser. "
-            "marimo does not support chart selections with VegaFusion yet.",
-        )
+            _note = f"Binned with polars into {_bins.height:,} cells (VegaFusion has no browser build)."
+        else:
+            with alt.data_transformers.enable("vegafusion"):
+                _heat = (
+                    alt.Chart(shown.select("x", "y"))
+                    .mark_rect()
+                    .encode(
+                        alt.X("x:Q", bin=alt.Bin(maxbins=160)),
+                        alt.Y("y:Q", bin=alt.Bin(maxbins=90)),
+                        alt.Color("count():Q", scale=alt.Scale(type="log"), legend=None),
+                    )
+                )
+                _el = mo.ui.altair_chart(
+                    (_heat + _out).properties(width="container", height=420), chart_selection=False, legend_selection=False
+                )
+            _note = (
+                "VegaFusion runs the binning in Python, so only bins (plus outlier points) reach the browser. "
+                "marimo does not support chart selections with VegaFusion yet."
+            )
+        _view, altair_vf_row = card("altair_vf", _el, _t.s(), html_payload(_el.text), _note)
     _view
     return (altair_vf_row,)
 
@@ -531,14 +590,14 @@ def _(mo, mpl_el, xs, ys):
 
 
 @app.cell
-def _(Timer, card, gate, mo, pd, shown, xo, yo):
+def _(IN_BROWSER, Timer, card, gate, importlib, mo, pd, shown, xo, yo):
     datashader_row = None
-    _view = gate("datashader")
+    _view = mo.md("") if IN_BROWSER else gate("datashader")
     if _view is None:
         import io as _io
 
-        import datashader as _ds
-        import datashader.transfer_functions as _tf
+        _ds = importlib.import_module("datashader")
+        _tf = importlib.import_module("datashader.transfer_functions")
 
         _t = Timer()
         # datashader takes pandas/dask/cuDF, not polars
@@ -560,12 +619,12 @@ def _(Timer, card, gate, mo, pd, shown, xo, yo):
 
 
 @app.cell
-def _(Timer, card, gate, html_payload, mo, shown, xo, yo):
+def _(IN_BROWSER, Timer, card, gate, html_payload, importlib, mo, shown, xo, yo):
     holoviews_row = None
-    _view = gate("holoviews")
+    _view = mo.md("") if IN_BROWSER else gate("holoviews")
     if _view is None:
-        import holoviews as _hv
-        from holoviews.operation.datashader import rasterize as _rasterize
+        _hv = importlib.import_module("holoviews")
+        _rasterize = importlib.import_module("holoviews.operation.datashader").rasterize
 
         _hv.extension("bokeh")
         _t = Timer()

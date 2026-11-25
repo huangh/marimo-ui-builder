@@ -1,9 +1,12 @@
-"""Build a self-contained WASM (Pyodide) export of notebooks/demo.py.
+"""Build self-contained WASM (Pyodide) exports for GitHub Pages.
 
-Pyodide can't pip-install this local package, so the library and my_ops sources are
-embedded in the first cell and written to the in-browser filesystem at startup.
+- notebooks/demo.py -> dist/wasm/index.html. Pyodide can't pip-install this local
+  package, so the library and my_ops sources are embedded in the first cell and written
+  to the in-browser filesystem at startup.
+- notebooks/plot_perf.py -> dist/wasm/plot_perf.html. Standalone; it detects the
+  browser build itself and leaves out libraries that have no Pyodide build.
 
-    uv run python scripts/build_wasm.py   # -> dist/wasm/index.html
+    uv run python scripts/build_wasm.py   # -> dist/wasm/
 """
 
 import re
@@ -35,12 +38,32 @@ bootstrap = f"""    import importlib, pathlib, sys
     chain_view, mode_toggle, preview = _aa.chain_view, _aa.mode_toggle, _aa.preview
 """
 nb = nb.replace(old_imports, bootstrap)
+old_intro = "the bottom, as polars code or DuckDB SQL.\n"
+assert old_intro in nb, "demo.py intro changed; update build_wasm.py"
+nb = nb.replace(
+    old_intro,
+    old_intro + "\n    See also the [scatter plot performance bench](plot_perf.html) (100k to 10M points).\n",
+)
 out_nb = ROOT / "dist" / "demo_wasm.py"
 out_nb.parent.mkdir(exist_ok=True)
 out_nb.write_text(nb)
 mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-subprocess.run(
-    ["marimo", "export", "html-wasm", str(out_nb), "-o", str(ROOT / "dist" / "wasm" / "index.html"), "--single-file", "--mode", mode, "--show-code", "-f"],
-    check=True,
-)
+
+
+def export(src: Path, html_name: str) -> None:
+    subprocess.run(
+        ["marimo", "export", "html-wasm", str(src), "-o", str(ROOT / "dist" / "wasm" / html_name), "--single-file", "--mode", mode, "--show-code", "-f"],
+        check=True,
+    )
+
+
+export(out_nb, "index.html")
+# Drop inline dependencies that have no Pyodide build (numba / Rust), so the browser
+# never tries to install them. The notebook skips those libraries when it runs there.
+NO_WASM = ("vegafusion", "vl-convert-python", "datashader", "holoviews", "hvplot", "lonboard")
+perf = (ROOT / "notebooks" / "plot_perf.py").read_text().splitlines(keepends=True)
+perf = [ln for ln in perf if not any(ln.startswith(f'#     "{name}') for name in NO_WASM)]
+perf_nb = ROOT / "dist" / "plot_perf.py"
+perf_nb.write_text("".join(perf))
+export(perf_nb, "plot_perf.html")
 print("built", ROOT / "dist" / "wasm")

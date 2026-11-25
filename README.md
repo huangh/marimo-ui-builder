@@ -81,3 +81,8 @@ uvx marimo edit --sandbox notebooks/plot_perf.py
 ```
 
 Findings: `notebooks/plot_perf_findings.md`.
+
+It also deploys with the demo, at https://huangh.github.io/marimo-ui-builder/plot_perf.html.
+In that browser build, Python runs in the tab (Pyodide), so its timings are slower. datashader,
+HoloViews and lonboard are left out because they need native code with no Pyodide build, and the
+Altair heatmap bins with polars instead of VegaFusion.
